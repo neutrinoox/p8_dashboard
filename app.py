@@ -1,5 +1,4 @@
 # app.py
-import io
 import json
 import time
 import requests
@@ -26,7 +25,6 @@ with st.sidebar:
         f"""
         <style>
         html, body, [class*="css"] {{ font-size: {font_scale}%; }}
-        /* Focus visible pour clavier (accessibilité) */
         :focus {{ outline: 3px solid #4F46E5 !important; outline-offset: 2px; }}
         </style>
         """,
@@ -37,7 +35,7 @@ with st.sidebar:
 # PARAMÈTRES API (P7)
 # ==============================
 API_BASE = "https://projet7-credit-scoring-api.onrender.com"
-ENDPOINTS = ["/predict", "/predict_proba", "/inference", "/score"]  # choisis celui qui répond
+ENDPOINTS = ["/predict", "/predict_proba", "/inference", "/score"]
 DEFAULT_ENDPOINT = "/predict"
 
 st.sidebar.header("🔌 Connexion à l’API")
@@ -45,7 +43,6 @@ endpoint_choice = st.sidebar.selectbox("Endpoint à tester", ENDPOINTS, index=EN
 timeout_s = st.sidebar.slider("⏱️ Délai d’attente (sec)", 5, 60, 20)
 threshold = st.sidebar.slider("Seuil décision (0–1)", 0.05, 0.95, 0.50, 0.01,
                               help="Seuil métier pour distinguer faible/modéré de élevé")
-
 mode = st.sidebar.radio("Mode", ["Prédiction unitaire", "Batch CSV"], help="CE1 : parcours utilisateur simple")
 
 # ==============================
@@ -57,24 +54,21 @@ st.caption("Connecté à l’API du P7 (LightGBM sur Home Credit). Démo publiqu
 with st.expander("🎯 Contexte & objectifs (1 min)", expanded=True):
     st.markdown("""
     **Objectif métier** : estimer le risque de défaut pour aider à la décision de crédit.  
-    **Parcours** (CE1) :
-    1) *Prédiction unitaire* : tester un profil type et lire la décision.
-    2) *Batch CSV* : charger plusieurs profils, voir la distribution des scores et un scatter métier.
+    **Parcours** :
+    1) *Prédiction unitaire* : tester un profil type et lire la décision (avec un graphique Score vs Seuil).  
+    2) *Batch CSV* : charger plusieurs profils, voir la distribution des scores et un scatter métier.  
     **Lecture du score** : plus le score est élevé, plus le risque est important. Le **seuil** est réglable (barre latérale).
     """)
 
-st.info("Accessibilité (WCAG) : titres explicites (2.4.2), texte redimensionnable (1.4.4), \
-contraste par thème, info-bulles lisibles, aucune information codée uniquement par la couleur (1.4.1), \
-contenus non textuels accompagnés d’un texte explicatif (1.1.1).")
+st.info("Accessibilité (WCAG) : titres explicites (2.4.2), texte redimensionnable (1.4.4), "
+        "contraste par thème, info-bulles lisibles, aucune information codée uniquement par la couleur (1.4.1), "
+        "contenus non textuels accompagnés d’un texte explicatif (1.1.1).")
 
 # ==============================
-# FONCTIONS UTILITAIRES
+# OUTILS
 # ==============================
 def call_api(payload):
-    """
-    Appelle l'API en POST avec le format attendu {"data": ...}
-    Corrige l'erreur HTTP 422: Field required 'data'
-    """
+    """POST {"data": ...} → corrige l'erreur 422 (Field 'data' requis)."""
     url = f"{API_BASE}{endpoint_choice}"
     headers = {"Content-Type": "application/json"}
     wrapped = {"data": payload}
@@ -87,18 +81,13 @@ def call_api(payload):
         return e, None
 
 def extract_probability(obj):
-    """
-    Récupère un score/proba quelle que soit la clé renvoyée par l'API.
-    (Ton API renvoie 'default_probability' d'après tes captures.)
-    """
-    candidate = ["default_probability", "probability", "proba", "score", "prediction_proba"]
-    if isinstance(obj, dict):
-        for k in candidate:
-            if k in obj:
-                try:
-                    return float(obj[k])
-                except Exception:
-                    pass
+    """Extrait une proba quelle que soit la clé renvoyée par l’API."""
+    for k in ["default_probability", "probability", "proba", "score", "prediction_proba"]:
+        if isinstance(obj, dict) and k in obj:
+            try:
+                return float(obj[k])
+            except Exception:
+                pass
     return None
 
 def label_from_prob(p, thr):
@@ -106,7 +95,26 @@ def label_from_prob(p, thr):
         return "Résultat indisponible"
     return ("⚠️ Risque élevé" if p >= thr else "✅ Risque modéré/faible") + f" — score: {p:.3f} (seuil={thr:.2f})"
 
-def altair_histogram(df, score_col, title):
+def normalize_predictions(out):
+    """
+    Convertit la réponse API en DataFrame et crée une colonne '__score__'
+    robuste (default_probability / probability / proba / score / prediction_proba).
+    """
+    if isinstance(out, list):
+        df = pd.DataFrame(out)
+    elif isinstance(out, dict) and "predictions" in out and isinstance(out["predictions"], list):
+        df = pd.DataFrame(out["predictions"])
+    else:
+        df = pd.DataFrame([out])
+
+    df["__score__"] = None
+    for cand in ["default_probability", "probability", "proba", "score", "prediction_proba"]:
+        if cand in df.columns:
+            df["__score__"] = pd.to_numeric(df[cand], errors="coerce")
+            break
+    return df
+
+def chart_hist(df, score_col="__score__", title="Distribution des probabilités de défaut"):
     return (
         alt.Chart(df)
         .mark_bar()
@@ -118,7 +126,9 @@ def altair_histogram(df, score_col, title):
         .properties(height=300, title=title)
     )
 
-def altair_scatter(df, x_col, y_col, title, tooltip_cols):
+def chart_scatter(df, x_col, y_col="__score__", title="Relation Score / Montant du crédit", tooltip_cols=None):
+    if tooltip_cols is None:
+        tooltip_cols = [x_col, y_col]
     return (
         alt.Chart(df)
         .mark_circle(size=60)
@@ -130,8 +140,23 @@ def altair_scatter(df, x_col, y_col, title, tooltip_cols):
         .properties(height=320, title=title)
     )
 
+def chart_unit_gauge(prob, thr):
+    """Graphique unitaire : barre horizontale [0..1] + règle verticale au seuil."""
+    if prob is None:
+        return None
+    df_bar = pd.DataFrame({"start":[0.0], "end":[float(prob)]})
+    base = alt.Chart(df_bar).mark_bar().encode(
+        x=alt.X("end:Q", title="Score (0 → 1)", scale=alt.Scale(domain=[0,1])),
+        tooltip=[alt.Tooltip("end:Q", title="Score")]
+    ).properties(height=60)
+    rule = alt.Chart(pd.DataFrame({"x":[float(thr)]})).mark_rule(strokeDash=[6,4]).encode(
+        x="x:Q",
+        tooltip=[alt.Tooltip("x:Q", title="Seuil")]
+    )
+    return base + rule
+
 # ==============================
-# PRÉDICTION UNITÉ
+# PRÉDICTION UNITÉ + 1 GRAPHIQUE
 # ==============================
 st.markdown("## 🧮 Test de prédiction")
 
@@ -198,17 +223,23 @@ if mode == "Prédiction unitaire":
                             prob = extract_probability(data)
                             risk_text = data.get("risk_level") if isinstance(data, dict) else None
                             decision = data.get("prediction") if isinstance(data, dict) else None
+
                             st.success(label_from_prob(prob, threshold) + (f" — niveau: {risk_text}" if risk_text else ""))
                             if decision:
                                 st.info(f"Interprétation : le modèle recommande **{decision}** pour ce dossier.")
+
+                            # 🔹 Graphique 1 : Score vs Seuil (toujours visible en mode unitaire)
+                            g1 = chart_unit_gauge(prob, threshold)
+                            if g1 is not None:
+                                st.altair_chart(g1, use_container_width=True)
 
                             st.code(json.dumps(data, indent=2, ensure_ascii=False), language="json")
                     else:
                         st.error(f"Code HTTP {resp.status_code}")
                         st.text(resp.text[:1500])
 
-        st.info("Lecture : en dessous du seuil, le profil est **modéré/faible** ; au-dessus, **élevé**. \
-Ajustez le **seuil** dans la barre latérale selon l’appétence au risque.")
+        st.info("Lecture : en dessous du seuil, le profil est **modéré/faible** ; au-dessus, **élevé**. "
+                "Ajustez le **seuil** dans la barre latérale selon l’appétence au risque.")
 
 # ==============================
 # BATCH CSV + 2 GRAPHIQUES (CE2)
@@ -233,12 +264,7 @@ if mode == "Batch CSV":
                 if resp.status_code == 200:
                     try:
                         out = resp.json()
-                        if isinstance(out, list):
-                            df_out = pd.DataFrame(out)
-                        elif isinstance(out, dict) and "predictions" in out:
-                            df_out = pd.DataFrame(out["predictions"])
-                        else:
-                            df_out = pd.DataFrame([out])
+                        df_out = normalize_predictions(out)
                     except Exception as e:
                         st.error(f"Réponse non lisible : {e}")
                         df_out = None
@@ -247,143 +273,30 @@ if mode == "Batch CSV":
                         st.success("Prédictions reçues ✅")
                         st.dataframe(df_out.head(30), use_container_width=True)
 
-                        # 1) Histogramme des scores (graphique interactif 1)
-                        score_col = None
-                        for c in df_out.columns:
-                            if c.lower() in {"default_probability", "probability", "proba", "score", "prediction_proba"}:
-                                score_col = c
-                                break
-                        if score_col:
+                        # 🔹 Graphique 2a : Histogramme des scores (interactif)
+                        if df_out["__score__"].notna().any():
                             st.markdown("### 📈 Distribution des scores (CE2, CE4)")
-                            st.altair_chart(altair_histogram(df_out, score_col, "Distribution des probabilités de défaut"),
-                                            use_container_width=True)
+                            st.altair_chart(chart_hist(df_out, "__score__"), use_container_width=True)
                         else:
                             st.info("Aucune colonne de score reconnue pour tracer la distribution.")
 
-                        # 2) Scatter métier Score vs Montant crédit (graphique interactif 2)
+                        # 🔹 Graphique 2b : Scatter Score vs Montant du crédit (ou index)
                         st.markdown("### 🟢 Score vs Montant du crédit (CE2, CE4)")
-                        if score_col and ("AMT_CREDIT" in df_in.columns):
-                            # Rejoindre entrée et sortie si besoin
+                        score_ok = df_out["__score__"].notna().any()
+                        if score_ok and ("AMT_CREDIT" in df_in.columns):
                             df_plot = df_in.copy()
-                            df_plot[score_col] = df_out[score_col]
-                            chart = altair_scatter(df_plot, "AMT_CREDIT", score_col,
-                                                   "Relation Score / Montant du crédit",
-                                                   ["AMT_CREDIT", score_col])
-                            st.altair_chart(chart, use_container_width=True)
-                        elif score_col:
-                            # Fallback si AMT_CREDIT absent
+                            df_plot["__score__"] = df_out["__score__"]
+                            st.altair_chart(chart_scatter(df_plot, "AMT_CREDIT"), use_container_width=True)
+                        elif score_ok:
                             df_tmp = df_out.copy()
                             df_tmp["index"] = range(len(df_tmp))
-                            chart = altair_scatter(df_tmp, "index", score_col,
-                                                   "Relation Score / Index (exemple)",
-                                                   ["index", score_col])
-                            st.altair_chart(chart, use_container_width=True)
+                            st.altair_chart(chart_scatter(df_tmp, "index", title="Relation Score / Index (exemple)"),
+                                            use_container_width=True)
                         else:
                             st.info("Ajoutez une colonne de score pour afficher le scatter métier.")
                 else:
                     st.error(f"Code HTTP {resp.status_code}")
                     st.text(resp.text[:1500])
-
-# ==============================
-# IMPORTANCE DES VARIABLES (CE4)
-# ==============================
-st.markdown("## 📊 Importance des variables")
-st.markdown(
-    "Illustration des variables qui contribuent le plus aux prédictions du modèle (P7). "
-    "Le dashboard utilise automatiquement `feature_importance.csv` s'il est présent "
-    "(colonnes **feature**, **importance**) ; sinon, une version illustrative est affichée."
-)
-
-def render_fi_chart(df):
-    df = df.sort_values("importance", ascending=False).head(20)
-    chart_fi = (
-        alt.Chart(df)
-        .mark_bar()
-        .encode(
-            x=alt.X("importance", title="Importance moyenne (gain LightGBM)"),
-            y=alt.Y("feature", sort='-x', title="Variables"),
-            tooltip=["feature", "importance"]
-        )
-        .properties(height=460, title="Top variables influentes")
-    )
-    st.altair_chart(chart_fi, use_container_width=True)
-
-try:
-    fi_df = pd.read_csv("feature_importance.csv")
-    if {"feature", "importance"}.issubset(fi_df.columns):
-        render_fi_chart(fi_df)
-    else:
-        st.info("`feature_importance.csv` n’a pas les colonnes attendues ('feature', 'importance'). \
-Affichage d’un exemple illustratif.")
-        raise FileNotFoundError
-except Exception:
-    demo_fi = pd.DataFrame({
-        "feature": [
-            "EXT_SOURCE_3","PAYMENT_RATE","EXT_SOURCE_2","AMT_CREDIT","DAYS_BIRTH",
-            "EXT_SOURCE_1","AMT_ANNUITY","INCOME_CREDIT_PERC","CREDIT_TO_ANNUITY_RATIO","DAYS_EMPLOYED_RATIO"
-        ],
-        "importance": [520,480,450,430,410,370,340,320,300,280]
-    })
-    st.caption("Affichage illustratif (sans fichier). Ajoutez un vrai `feature_importance.csv` pour le remplacer.")
-    render_fi_chart(demo_fi)
-
-# ==============================
-# VEILLE TECHNIQUE & NOTE MÉTHODO (supports livrables)
-# ==============================
-st.markdown("## 🔎 Veille technique & Note méthodologique (supports)")
-st.markdown(
-    "Cette section fournit des **modèles à compléter** pour votre livrable 2 (notebook de veille) "
-    "et votre **note méthodologique** (livrable 3). Téléchargez, complétez, puis déposez sur la plateforme."
-)
-
-veille_md = """# Veille technique – P8
-## 1. Sources récentes (3–5)
-- [Auteur, année] Titre — source (blog/conference/journal). Lien:
-- [Auteur, année] ...
-## 2. Points clés (avec détails mathématiques)
-- Méthode A : principe, équations, complexité, limites
-- Méthode B : ...
-## 3. Preuve de concept (PoC)
-- Données utilisées:
-- Baseline (classique) vs Nouvelle approche (récente):
-- Protocole, métriques (AUC/PR/Recall@k...), résultats comparés
-## 4. Conclusion
-- Apports réels, risques, recommandations d’adoption
-"""
-
-note_md = """# Note méthodologique – P8 (10 pages max)
-## 1. Démarche de modélisation (synthèse)
-- Jeu de données, features, split, pipeline
-## 2. Métrique d’évaluation & optimisation
-- Métrique retenue (justification métier)
-- Stratégie d’optimisation (CV, recherche d’hyperparamètres)
-## 3. Interprétabilité globale & locale
-- Importance des variables (globale), exemples locaux (ex: LIME/SHAP)
-## 4. Limites & améliorations
-- Biais potentiels, data drift, axes d’amélioration (features, seuil, calibration)
-"""
-
-col_dl1, col_dl2 = st.columns(2)
-with col_dl1:
-    st.download_button(
-        "📥 Télécharger le modèle Veille (Markdown)",
-        data=veille_md.encode("utf-8"),
-        file_name="modele_veille_P8.md",
-        mime="text/markdown"
-    )
-with col_dl2:
-    st.download_button(
-        "📥 Télécharger la Note méthodologique (Markdown)",
-        data=note_md.encode("utf-8"),
-        file_name="modele_note_methodo_P8.md",
-        mime="text/markdown"
-    )
-
-st.markdown("> **Rappel Livrables** : \
-**1)** Dashboard déployé ; **2)** Notebook de veille (technique récente texte/image) ; \
-**3)** Note méthodo (10 pages) ; **4)** Présentation (≤ 30 slides). \
-Nommer : `Nom_Prénom_1_dashboard_mmaaaa`, `Nom_Prénom_2_notebook_veille_mmaaaa`, \
-`Nom_Prénom_3_note_méthodologique_mmaaaa`, `Nom_Prénom_4_presentation_mmaaaa`.")
 
 # ==============================
 # PIED DE PAGE
@@ -394,3 +307,4 @@ st.markdown(
     "Pensé pour un public non technique : parcours simple (CE1), au moins deux graphiques interactifs (CE2), "
     "lisibles et pertinents métier (CE3–CE4), critères WCAG clés (CE5), déployé sur le web (CE6)."
 )
+
