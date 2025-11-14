@@ -23,7 +23,7 @@ st.set_page_config(
 API_MODEL_DEFAULT = "https://projet7-credit-scoring-api.onrender.com"
 
 # Nom du fichier local dans le repo GitHub
-TRAIN_DATA_PATH_DEFAULT = "train_sample (1).csv"
+TRAIN_DATA_PATH_DEFAULT = "train_sample_with_id.csv"
 
 # Altair : autoriser beaucoup de lignes
 alt.data_transformers.disable_max_rows()
@@ -48,9 +48,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🏦 P8 – Dashboard Scoring Crédit")
+st.title("P8 – Dashboard Scoring Crédit")
 st.caption(
-    "Échantillon local `train_sample (1).csv` + API modèle Render. "
+    "Échantillon local `train_sample_with_id.csv.csv` + API modèle Render. "
     "Recherche par ID client, score de risque, et exploration interactive."
 )
 
@@ -414,6 +414,7 @@ with st.expander("ℹ️ Notes pour la soutenance"):
 - Les graphiques sont interactifs, lisibles, pertinents métier.
         """
     )
+
 
 
 
