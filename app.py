@@ -335,14 +335,4 @@ else:
     else:
         st.info("Sélectionne au moins 2 variables pour la heatmap.")
 
-# ==============================
-# AIDE
-# ==============================
-with st.expander(" Notes"):
-    st.markdown(
-- **Prédiction** : envoie au modèle les colonnes numériques disponibles pour l’ID choisi.
-- **SHAP** : affiché automatiquement si un endpoint `/shap` existe côté API modèle.
-- **Scatter** : zoom/pan avec la souris, double-clic pour reset.
-        
-    )
 
