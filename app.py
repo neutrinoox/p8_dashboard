@@ -84,13 +84,15 @@ if len(num_cols) < 2:
     st.error("Il faut au moins 2 colonnes numériques pour ce dashboard.")
     st.stop()
 
-# Détection de la colonne ID
-ID_CANDIDATES = ["SK_ID_CURR", "client_id", "CLIENT_ID", "ID", "id"]
-id_col_auto = next((c for c in ID_CANDIDATES if c in df.columns), df.columns[0])
+# ==============================
+# COLONNE ID CLIENT FIXE
+# ==============================
+if "SK_ID_CURR" not in df.columns:
+    st.error("❌ La colonne SK_ID_CURR n’existe pas dans le fichier. Impossible d’identifier les clients.")
+    st.stop()
 
-with st.expander("Colonne identifiant client", expanded=False):
-    id_col = st.selectbox("Colonne ID", options=list(df.columns), index=list(df.columns).index(id_col_auto))
-    st.caption(f"Cette colonne sera utilisée pour rechercher un client (ex : `{id_col}`).")
+id_col = "SK_ID_CURR"
+st.caption("🔑 Colonne ID client utilisée : **SK_ID_CURR** (Home Credit)")
 
 # ==============================
 # OUTILS API
@@ -138,7 +140,7 @@ st.markdown("## 🔎 Rechercher un client")
 
 c1, c2, c3 = st.columns([1.2, 1, 1])
 with c1:
-    query_id = st.text_input(f"ID client ({id_col})", "")
+    query_id = st.text_input(f"ID client (SK_ID_CURR)", "")
 with c2:
     pick = st.selectbox(
         "…ou sélectionner un ID existant",
@@ -409,9 +411,9 @@ with st.expander("ℹ️ Notes pour la soutenance"):
         """
 - Les données viennent d’un **échantillon local** (`train_sample (1).csv`) pour rester léger.
 - Le modèle est consommé via l’**API déployée sur Render** (`/predict`).
-- L’API pourrait être enrichie plus tard pour une meilleure interprétabilité.
 - Les graphiques sont interactifs, lisibles, pertinents métier.
         """
     )
+
 
 
