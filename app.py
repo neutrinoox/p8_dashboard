@@ -1,17 +1,20 @@
 # app.py
 import json
 import time
+import gc
+import math
 import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 import altair as alt
-from functools import lru_cache
+from typing import List, Optional
 
 # ==============================
 # CONFIG
 # ==============================
 st.set_page_config(page_title="P8 – Dashboard Scoring Crédit", page_icon="📊", layout="wide")
+alt.data_transformers.disable_max_rows()  # autorise de gros jeux dans les charts
 
 API_MODEL_DEFAULT = "https://projet7-credit-scoring-api.onrender.com"
 TRAIN_DATA_URL_DEFAULT = "https://sdz8rwt21sedumxt.public.blob.vercel-storage.com/train_data.csv"
@@ -20,9 +23,14 @@ TRAIN_DATA_URL_DEFAULT = "https://sdz8rwt21sedumxt.public.blob.vercel-storage.co
 # SIDEBAR
 # ==============================
 with st.sidebar:
-    st.header("Réglages")
+    st.header(" Réglages & Mémoire")
     MODEL_URL = st.text_input("URL API Modèle (Render)", API_MODEL_DEFAULT)
     DATA_URL = st.text_input("URL TrainData (Vercel Blob)", TRAIN_DATA_URL_DEFAULT)
+
+    # Anti-OOM: taille échantillon et colonnes à charger
+    sample_max = st.number_input("Taille max de l’échantillon (lignes)", min_value=5_000, max_value=300_000, value=80_000, step=5_000)
+    chunk_size = st.number_input("Taille des chunks (lignes)", min_value=50_000, max_value=500_000, value=150_000, step=10_000)
+    usecols_raw = st.text_input("Colonnes à conserver (optionnel, séparées par des virgules)", "")
     threshold = st.slider("Seuil décision (0–1)", 0.05, 0.95, 0.50, 0.01)
     font_scale = st.slider("Taille du texte (%)", 90, 170, 110, 5)
 
@@ -37,55 +45,127 @@ st.markdown(
 )
 
 st.title("P8 – Dashboard Scoring Crédit")
-st.caption("Connecte la bdd (Vercel Blob) et mon API modèle (Render). Compare par ID client, prédis le risque, explore les variables.")
+st.caption("Charge un échantillon mémoire-safe depuis Vercel Blob, interroge l’API Render, compare par ID, explore et explique.")
 
 # ==============================
-# DATA
+# OUTILS CHARGEMENT MEMOIRE-SAFE
 # ==============================
-@st.cache_data(show_spinner=True)
-def load_train_data(url: str, sample_max: int = 120_000) -> pd.DataFrame:
-    df = pd.read_csv(url)
-    # sécurité UX : supprime index parasite si présent
-    if "Unnamed: 0" in df.columns:
-        df = df.drop(columns=["Unnamed: 0"])
-    # échantillonnage si trop gros (fluidité)
-    if len(df) > sample_max:
-        df = df.sample(sample_max, random_state=42)
+def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    num = df.select_dtypes(include=[np.number]).columns
+    for c in num:
+        col = df[c]
+        if pd.api.types.is_float_dtype(col):
+            df[c] = pd.to_numeric(col, downcast="float")  # float32
+        elif pd.api.types.is_integer_dtype(col):
+            df[c] = pd.to_numeric(col, downcast="integer")  # int32/int16
     return df
 
-df = None
-load_error = None
-with st.spinner("Chargement de la bdd…"):
-    try:
-        df = load_train_data(DATA_URL)
-    except Exception as e:
-        load_error = str(e)
+@st.cache_data(show_spinner=True)
+def load_head(url: str, nrows: int = 5000) -> pd.DataFrame:
+    dfh = pd.read_csv(url, nrows=nrows)
+    if "Unnamed: 0" in dfh.columns:
+        dfh = dfh.drop(columns=["Unnamed: 0"])
+    return _downcast_numeric(dfh)
 
-if load_error:
-    st.error(f"Impossible de charger le bdd : {load_error}")
+@st.cache_data(show_spinner=True)
+def count_rows_stream(url: str, chunk_size: int) -> int:
+    total = 0
+    for chunk in pd.read_csv(url, chunksize=chunk_size):
+        total += len(chunk)
+        del chunk
+        gc.collect()
+    return total
+
+@st.cache_data(show_spinner=True)
+def load_sample_stream(
+    url: str,
+    sample_max: int,
+    chunk_size: int,
+    usecols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    2 passes mémoire-safe :
+    - pass 1 : compte les lignes totales
+    - pass 2 : échantillon proportionnel par chunk pour atteindre sample_max
+    """
+    # Pass 1: count
+    total = 0
+    for chunk in pd.read_csv(url, chunksize=chunk_size, usecols=usecols):
+        total += len(chunk)
+        del chunk
+        gc.collect()
+
+    if total == 0:
+        return pd.DataFrame()
+
+    # Pass 2: proportional sampling
+    remain = sample_max
+    taken_frames = []
+    seen = 0
+    for chunk in pd.read_csv(url, chunksize=chunk_size, usecols=usecols):
+        n = len(chunk)
+        seen += n
+        # nombre à prendre dans ce chunk (proportionnel)
+        to_take = min(n, max(0, math.ceil(sample_max * (n / total))))
+        if to_take > 0:
+            sub = chunk.sample(n=to_take, random_state=42)
+            if "Unnamed: 0" in sub.columns:
+                sub = sub.drop(columns=["Unnamed: 0"])
+            taken_frames.append(sub)
+        del chunk
+        gc.collect()
+
+    if not taken_frames:
+        return pd.DataFrame()
+
+    df = pd.concat(taken_frames, ignore_index=True)
+    # si on a prélevé un peu trop, on recadre
+    if len(df) > sample_max:
+        df = df.sample(sample_max, random_state=42).reset_index(drop=True)
+
+    df = _downcast_numeric(df)
+    return df
+
+# ==============================
+# CHARGEMENT DATA
+# ==============================
+with st.spinner(" Préparation des métadonnées…"):
+    head = load_head(DATA_URL)
+    all_columns = head.columns.tolist()
+
+# ID heuristique
+ID_CANDIDATES = ["SK_ID_CURR", "client_id", "CLIENT_ID", "ID", "id"]
+id_col_default = next((c for c in ID_CANDIDATES if c in all_columns), all_columns[0])
+
+with st.expander(" Pré-sélection des colonnes (optionnel)"):
+    st.markdown("Restriction possible des colonnes pour alléger la mémoire. laisse vider pour tout charger.")
+    st.code("Exemple : SK_ID_CURR,AMT_CREDIT,AMT_ANNUITY,AMT_INCOME_TOTAL,EXT_SOURCE_1,EXT_SOURCE_2,EXT_SOURCE_3")
+    id_col = st.selectbox("Colonne ID", options=all_columns, index=all_columns.index(id_col_default))
+    if usecols_raw.strip():
+        usecols = [c.strip() for c in usecols_raw.split(",") if c.strip() in all_columns]
+        if id_col not in usecols:
+            usecols = [id_col] + usecols
+    else:
+        usecols = None  # toutes colonnes
+
+with st.spinner("Chargement mémoire-safe de l’échantillon…"):
+    try:
+        df = load_sample_stream(DATA_URL, sample_max=int(sample_max), chunk_size=int(chunk_size), usecols=usecols)
+    except Exception as e:
+        st.error(f"Échec du chargement échantillonné : {e}")
+        st.stop()
+
+if df.empty:
+    st.error("Le dataset est vide après chargement. Vérifiez l’URL ou les colonnes sélectionnées.")
     st.stop()
 
-st.success(f"bdd chargée : {df.shape[0]:,} lignes × {df.shape[1]:,} colonnes")
-
-# Détection automatique de la colonne ID
-ID = ["SK_ID_CURR"]
-id_col = next((c for c in ID if c in df.columns), None)
-if not id_col:
-    st.warning(
-        "Colonne ID non détectée automatiquement. Merci de la choisir ci-dessous."
-    )
-    id_col = st.selectbox("Colonne ID", options=list(df.columns))
-else:
-    with st.expander(" Colonne ID détectée", expanded=False):
-        st.write(f"Utilisation de **{id_col}** comme identifiant client.")
-
+st.success(f"Échantillon chargé : {df.shape[0]:,} lignes × {df.shape[1]:,} colonnes")
 num_cols = df.select_dtypes(include=np.number).columns.tolist()
 
 # ==============================
-# OUTILS API
+# OUTILS API (modèle)
 # ==============================
-def call_predict(model_url: str, features: dict, cid: str = None, timeout_s: int = 25):
-    """Appel à /predict de l’API modèle (Render)."""
+def call_predict(model_url: str, features: dict, cid: Optional[str] = None, timeout_s: int = 25):
     url = model_url.rstrip("/") + "/predict"
     payload = {"data": features}
     if cid is not None:
@@ -97,8 +177,7 @@ def call_predict(model_url: str, features: dict, cid: str = None, timeout_s: int
     return r, dt
 
 def try_fetch_shap(model_url: str, cid: str, features: dict, timeout_s: int = 25):
-    """Optionnel : essaie /shap s'il existe (sinon None). Plusieurs variantes gérées."""
-    # 1) GET /shap?client_id=
+    # GET /shap?client_id=
     try:
         url = model_url.rstrip("/") + "/shap"
         r = requests.get(url, params={"client_id": cid}, timeout=timeout_s)
@@ -106,7 +185,7 @@ def try_fetch_shap(model_url: str, cid: str, features: dict, timeout_s: int = 25
             return r.json()
     except Exception:
         pass
-    # 2) POST /shap avec payload
+    # POST /shap
     try:
         url = model_url.rstrip("/") + "/shap"
         payload = {"data": features, "client_id": str(cid)}
@@ -120,7 +199,7 @@ def try_fetch_shap(model_url: str, cid: str, features: dict, timeout_s: int = 25
 # ==============================
 # RECHERCHE CLIENT & PRÉDICTION
 # ==============================
-st.markdown("## Rechercher un client")
+st.markdown("##Rechercher un client")
 
 c1, c2, c3 = st.columns([1.2, 1, 1])
 with c1:
@@ -148,39 +227,32 @@ if cargar:
 # ACTION : PRÉDIRE
 # ==============================
 st.markdown("---")
-st.markdown("##Prédiction du risque")
+st.markdown("## 🧮 Prédiction du risque")
 
 colp1, colp2 = st.columns([1, 1])
 with colp1:
-    st.caption("Le payload enverra **toutes les colonnes numériques** de la bdd pour ce client")
+    st.caption("Le payload enverra **les colonnes numériques** disponibles pour ce client (les autres sont ignorées).")
 with colp2:
     predict_now = st.button("Calculer le risque (API Render)", use_container_width=True)
 
 pred_result = None
 pred_time = None
+features_used = {}
 if predict_now:
     if client_row is None:
         st.warning("Charge d’abord un client.")
     else:
-        features = {}
-        for c in df.columns:
+        # construit un payload compact
+        feats = {}
+        for c in num_cols:
             val = client_row[c]
-            # envoie de préférence les numériques ; garde les autres simples si convertibles
-            if pd.api.types.is_numeric_dtype(df[c]):
-                if pd.isna(val):
-                    continue
-                features[c] = float(val)
-            else:
-                # Tente conversion légère si plausible
-                try:
-                    fv = float(val)
-                    features[c] = fv
-                except Exception:
-                    # sinon, ignore (l’API ajoutera les features manquantes via imputer)
-                    pass
+            if pd.isna(val):
+                continue
+            feats[c] = float(val)
+        features_used = feats
 
         try:
-            r, dt = call_predict(MODEL_URL, features, cid=str(client_row[id_col]))
+            r, dt = call_predict(MODEL_URL, feats, cid=str(client_row[id_col]))
             pred_time = dt
             if r.status_code == 200:
                 pred_result = r.json()
@@ -206,7 +278,7 @@ if pred_result:
 
     # Jauge linéaire vs seuil
     if isinstance(prob, (int,float)):
-        df_bar = pd.DataFrame({"score":[float(prob)], "zero":[0.0]})
+        df_bar = pd.DataFrame({"score":[float(prob)]})
         base = alt.Chart(df_bar).mark_bar().encode(
             x=alt.X("score:Q", title="Score (0 → 1)", scale=alt.Scale(domain=[0,1])),
             tooltip=[alt.Tooltip("score:Q", title="Score")]
@@ -215,12 +287,12 @@ if pred_result:
         st.altair_chart(base + rule, use_container_width=True)
 
 # ==============================
-# SHAP (si disponible)
+# SHAP (
 # ==============================
-st.markdown("##Interprétation locale (SHAP)")
+st.markdown("##  Interprétation locale (SHAP)")
 if pred_result and client_row is not None:
     with st.spinner("Tentative de récupération des SHAP…"):
-        shap_res = try_fetch_shap(MODEL_URL, str(client_row[id_col]), features if predict_now else {})
+        shap_res = try_fetch_shap(MODEL_URL, str(client_row[id_col]), features_used)
     if shap_res and isinstance(shap_res, dict) and "shap_values" in shap_res:
         shap_series = pd.Series(shap_res["shap_values"]).sort_values(key=lambda x: x.abs(), ascending=False)
         topk = st.slider("Top features à afficher", 5, min(30, len(shap_series)), 12)
@@ -236,9 +308,9 @@ st.markdown("---")
 st.markdown("## 📊 Exploration interactive (client vs population)")
 
 if len(num_cols) < 2:
-    st.warning("Il faut au moins 2 colonnes numériques dans le TrainData pour les graphiques.")
+    st.warning("Il faut au moins 2 colonnes numériques pour les graphiques.")
 else:
-    # 1) Scatter multi-variables (X/Y + color + taille optionnelle)
+    # 1) Scatter multi-variables
     st.markdown("### 1) 🌐 Nuage de points configurable")
     cx, cy = st.columns(2)
     with cx:
@@ -264,6 +336,7 @@ else:
 
     zoom = alt.selection_interval(bind="scales")
     chart_scatter = base.add_selection(zoom).properties(height=380)
+
     # point client
     if client_row is not None and pd.notna(client_row.get(x_var)) and pd.notna(client_row.get(y_var)):
         client_point = pd.DataFrame([{x_var: float(client_row[x_var]), y_var: float(client_row[y_var])}])
@@ -271,10 +344,11 @@ else:
             x=f"{x_var}:Q", y=f"{y_var}:Q"
         )
         chart_scatter = chart_scatter + highlight
+
     st.altair_chart(chart_scatter, use_container_width=True)
 
-    # 2) Histogramme avec marqueur client + percentile
-    st.markdown("### 2) Distribution d’une variable (avec position du client)")
+    # 2) Histogramme + percentile + z-score
+    st.markdown("### 2) 📈 Distribution d’une variable (avec position du client)")
     hv1, hv2, hv3 = st.columns([2,1,1])
     with hv1:
         hist_var = st.selectbox("Variable à explorer", options=num_cols, index=num_cols.index("AMT_CREDIT") if "AMT_CREDIT" in num_cols else 0)
@@ -314,10 +388,10 @@ else:
         else:
             st.metric("z-score du client", "—")
 
-    # 3) Carte de corrélations (heatmap) – interactive
-    st.markdown("### 3) Carte de corrélations (sélection de variables)")
+    # 3) Heatmap corrélations
+    st.markdown("### 3) Carte de corrélations (sélection)")
     sel_vars = st.multiselect(
-        "variables numériques",
+        "Variables numériques",
         options=num_cols,
         default=[v for v in ["AMT_CREDIT","AMT_ANNUITY","AMT_INCOME_TOTAL","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3"] if v in num_cols][:6],
     )
@@ -335,4 +409,17 @@ else:
     else:
         st.info("Sélectionne au moins 2 variables pour la heatmap.")
 
+# ==============================
+# NOTES
+# ==============================
+with st.expander(" Notes perf & mémoire"):
+    st.markdown(
+        """
+- **Chargement en 2 passes** : compte les lignes, puis échantillonne proportionnellement par chunk → **pas de pic mémoire**.
+- **Downcast** des numériques en *float32/int32* pour réduire l’empreinte RAM.
+- **Réduis les colonnes** (champ *Colonnes à conserver*) si besoin (ID + variables clés).
+- **Augmente/réduis** *Taille des chunks* et *Taille de l’échantillon* selon ta machine.
+- **Altair** est configuré pour accepter de gros échantillons sans couper les données.
+        """
+    )
 
