@@ -1,7 +1,7 @@
 # app.py
+# app.py
 import json
 import time
-import gc
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ st.set_page_config(
 API_MODEL_DEFAULT = "https://projet7-credit-scoring-api.onrender.com"
 
 # Nom du fichier local dans le repo GitHub
+# ⚠️ Mets ici le nom exact de ton sample (par ex. "train_sample_with_id.csv")
 TRAIN_DATA_PATH_DEFAULT = "train_sample_with_id.csv"
 
 # Altair : autoriser beaucoup de lignes
@@ -48,10 +49,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("P8 – Dashboard Scoring Crédit")
+st.title("🏦 P8 – Dashboard Scoring Crédit")
 st.caption(
-    "Échantillon local `train_sample_with_id.csv.csv` + API modèle Render. "
-    "Recherche par ID client, score de risque, et exploration interactive."
+    "Échantillon local + API modèle Render. "
+    "Recherche par ID client (SK_ID_CURR), score de risque, et exploration interactive."
 )
 
 # ==============================
@@ -67,6 +68,7 @@ def load_train_data(path: str) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], downcast="float")
     for col in df.select_dtypes(include=["int64"]).columns:
         df[col] = pd.to_numeric(df[col], downcast="integer")
+
     return df
 
 
@@ -88,7 +90,7 @@ if len(num_cols) < 2:
 # COLONNE ID CLIENT FIXE
 # ==============================
 if "SK_ID_CURR" not in df.columns:
-    st.error("❌ La colonne SK_ID_CURR n’existe pas dans le fichier. Impossible d’identifier les clients.")
+    st.error("❌ La colonne SK_ID_CURR n’existe pas dans le fichier. Vérifie ton sample.")
     st.stop()
 
 id_col = "SK_ID_CURR"
@@ -134,13 +136,19 @@ def try_fetch_shap(model_url: str, cid: str, features: dict, timeout_s: int = 25
     return None
 
 # ==============================
+# SESSION STATE POUR L'ID CLIENT
+# ==============================
+if "selected_client_id" not in st.session_state:
+    st.session_state["selected_client_id"] = None
+
+# ==============================
 # RECHERCHER UN CLIENT
 # ==============================
 st.markdown("## 🔎 Rechercher un client")
 
 c1, c2, c3 = st.columns([1.2, 1, 1])
 with c1:
-    query_id = st.text_input(f"ID client (SK_ID_CURR)", "")
+    query_id = st.text_input("ID client (SK_ID_CURR)", "")
 with c2:
     pick = st.selectbox(
         "…ou sélectionner un ID existant",
@@ -150,7 +158,7 @@ with c2:
 with c3:
     cargar = st.button("Charger le client", use_container_width=True)
 
-client_row = None
+# Quand on clique sur "Charger le client", on mémorise l'ID dans la session
 if cargar:
     use_id = query_id.strip() or (pick if pick != "—" else "")
     if not use_id:
@@ -160,9 +168,16 @@ if cargar:
         if sub.empty:
             st.error(f"Aucun client avec {id_col} = {use_id}")
         else:
-            client_row = sub.iloc[0]
+            st.session_state["selected_client_id"] = str(use_id)
             st.success(f"Client {use_id} chargé.")
-            st.dataframe(client_row.to_frame().T, use_container_width=True)
+
+# On reconstruit toujours client_row à partir de l'ID stocké en session
+client_row = None
+if st.session_state["selected_client_id"] is not None:
+    sub = df[df[id_col].astype(str) == str(st.session_state["selected_client_id"])]
+    if not sub.empty:
+        client_row = sub.iloc[0]
+        st.dataframe(client_row.to_frame().T, use_container_width=True)
 
 # ==============================
 # PRÉDICTION DE RISQUE
@@ -409,12 +424,12 @@ else:
 with st.expander("ℹ️ Notes pour la soutenance"):
     st.markdown(
         """
-- Les données viennent d’un **échantillon local** (`train_sample (1).csv`) pour rester léger.
+- Les données viennent d’un **échantillon local** pour rester léger.
 - Le modèle est consommé via l’**API déployée sur Render** (`/predict`).
+- La sélection du client est persistée grâce à `st.session_state` pour éviter de le “perdre” entre deux clics.
 - Les graphiques sont interactifs, lisibles, pertinents métier.
         """
     )
-
 
 
 
